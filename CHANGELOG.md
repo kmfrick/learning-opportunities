@@ -1,5 +1,10 @@
 # Changelog
 
+## learning-opportunities-auto 1.0.3
+
+**Fixed:**
+- Narrowed the Codex post-tool-use hook to read `cmd`/`command` only from the actual tool input, avoiding false positives from nested hook payload fields
+
 ## learning-opportunities-auto 1.0.2
 
 **Fixed:**
