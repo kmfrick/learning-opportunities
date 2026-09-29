@@ -1,12 +1,12 @@
 # learning-opportunities-auto
 
-A companion plugin for [learning-opportunities](../learning-opportunities/) that automatically detects good moments to offer learning exercises. Instead of relying on Claude to notice opportunities on its own, this plugin uses a `PostToolUse` hook to watch for significant code changes and nudge Claude to make the offer.
+A companion plugin for [learning-opportunities](../learning-opportunities/) that automatically detects good moments to offer learning exercises. Instead of relying on Claude to notice opportunities on its own, this plugin uses `PreToolUse` and `PostToolUse` hooks to watch for commits and nudge Claude to make the offer.
 
 **Requires:** The `learning-opportunities` plugin must also be installed.
 
 ## How It Works
 
-The hook fires after every `Bash` tool use and checks whether the command was a `git commit`. After a successful commit, it nudges Claude to consider whether the work that was just committed is a good fit for a learning exercise — the `learning-opportunities` skill handles deciding what kind of exercise to offer based on the nature of the changes.
+The hook runs before and after every `Bash` tool use that mentions `git` and `commit`. Before the command, it records the size of the repository's HEAD reflog; afterwards, it checks whether the command added a commit entry. This catches commits however they were run (through wrappers, `sh -c`, or scripts) and ignores dry runs, failed commits, and commit text that was only written or printed. After a commit, it nudges Claude to consider whether the work that was just committed is a good fit for a learning exercise — the `learning-opportunities` skill handles deciding what kind of exercise to offer based on the nature of the changes.
 
 The hook caps automatic offers at 2 per session; the skill separately stops offering after the user declines or completes an exercise.
 
@@ -40,11 +40,11 @@ If you run into issues, check that `Git\bin` (not just `Git\cmd`) is on your PAT
 
 ## Codex Support
 
-Codex uses `hooks.codex.json`, which runs the same `hooks/post-tool-use.sh` script from the installed plugin root. The script reads the standard `tool_input.command` payload field and accepts `tool_input.cmd` as a compatibility fallback.
+Codex uses `hooks.codex.json`, which runs the same `hooks/post-tool-use.sh` script from the installed plugin root. The script reads the standard `tool_input.command` payload field and accepts `tool_input.cmd` as a compatibility fallback. It uses the payload's `cwd` to find the repository, falling back to the hook's working directory.
 
 ## How Hooks Work
 
-This plugin uses post-tool-use hooks to run a script after each shell command. Claude Code reads `hooks/hooks.json`; Codex reads `hooks.codex.json`. The hook script itself lives at `hooks/post-tool-use.sh`.
+This plugin uses pre- and post-tool-use hooks to run a script around each shell command; the pre phase passes `pre` to the script. Claude Code reads `hooks/hooks.json`; Codex reads `hooks.codex.json`. The hook script itself lives at `hooks/post-tool-use.sh`.
 
 ## License
 

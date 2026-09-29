@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|exec_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'script=\"${PLUGIN_ROOT}/hooks/post-tool-use.sh\"; [ -f \"$script\" ] && exec bash \"$script\" pre || exit 0'"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash|exec_command",

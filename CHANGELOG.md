@@ -2,18 +2,15 @@
 
 ## learning-opportunities-auto 1.0.3
 
+**Changed:**
+- Detect commits from the repository's HEAD reflog instead of parsing the shell command. A new `PreToolUse` hook records the reflog's size, and the `PostToolUse` hook nudges only when the command added a commit entry. Commits are recognized however they are run (wrappers, `sh -c`, scripts, multi-line messages), and dry runs, failed commits, and commit text in heredocs or echoed output never trigger
+- The nudge no longer asks Claude to check whether the commit succeeded, since only successful commits trigger it
+
 **Fixed:**
-- Read commit commands only from the top-level hook input, avoiding false positives from command text in tool output
 - Use Codex's plugin root environment variable instead of a version-specific cache path, while still failing silently if the resolved script is missing
-- Stop parsing once the required fields are found so large tool responses do not delay every shell command
-- Recognize Git commits that use documented global options
-- Recognize Git commits behind shell assignments and execution wrappers
-- Preserve the automatic two-offer session cap, including for an empty or newline-containing session id
-- Recognize commits inside `bash -c`/`sh -c`, `env -S`/`--split-string`, and `$(...)`/backtick bodies that contain an escaped quote
-- Ignore `git commit` text inside heredoc bodies, such as a script written with `cat <<'EOF'`
-- Recognize commits whose multi-line quoted message contains help or dry-run text
-- Recognize commits behind `timeout` and `gtimeout`
+- Read the command only from the top-level hook input, and stop parsing once the required fields are found, so large tool responses do not delay every shell command
 - Keep JSON parsing linear for payloads with many strings or escapes
+- Preserve the automatic two-offer session cap, including for an empty or newline-containing session id
 
 ## learning-opportunities-auto 1.0.2
 

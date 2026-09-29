@@ -1,5 +1,13 @@
 # Fixes
 
+> **Superseded detection approach.** The entries below describe fixes to a
+> shell-command parser that tried to decide from the command text whether a
+> commit ran. Each review found another shell construct it misread, so the hook
+> now asks the repository instead: a `PreToolUse` phase records the size of the
+> HEAD reflog, and the `PostToolUse` phase nudges only if the command appended a
+> `commit` entry. The parser-specific entries are kept as history; the JSON
+> parsing, Codex path, and session-cap fixes still apply.
+
 - **False learning prompts:** The hook searched the entire post-tool payload, so
   command text echoed in `tool_response` could look like a commit. The parser now
   reads only direct `session_id` and `tool_input.command` fields.
