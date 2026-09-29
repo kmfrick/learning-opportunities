@@ -192,6 +192,25 @@
   `command` field out of each hook config only matched one exact
   formatting (single space after the colon, LF line endings). It now
   tolerates whitespace variation and strips `\r`.
+- **Heredoc bodies read as commands:** Writing a script with
+  `cat > file <<'EOF'` whose body contained `git commit` triggered a nudge and
+  spent one of the session's two offers. Heredoc bodies are now dropped before
+  detection, including `<<-` bodies and heredocs inside `sh -c` code, while
+  `$(...)` and backticks in unquoted-delimiter bodies are still checked because
+  the shell runs them. Here-strings and `$((1<<2))` are not mistaken for
+  heredocs.
+- **Multi-line quoted messages:** The quote-collapsing rules worked line by
+  line, so `-h`, `--help`, or `--dry-run` on the first line of a multi-line
+  `-m` message hid the commit. Quoted text spanning lines is now collapsed to
+  one argument first, except when it holds a substitution or `sh -c`/`eval`
+  code that may itself run a commit.
+- **Missed `timeout` wrapper:** `timeout 30 git commit` was ignored. `timeout`
+  and `gtimeout` options and the duration are now consumed before the command.
+- **Quadratic JSON parsing:** Each string copied the rest of the payload, and
+  decoding appended once per escape, so a late `session_id` or a heredoc with
+  tens of thousands of escapes took seconds to a minute. Input is now split
+  into records at quotes and decoded with whole-string substitutions, with
+  `\u` escapes decoded last so a decoded backslash never starts an escape.
 
 The hook detection and performance fixes have regression coverage in
 `learning-opportunities-auto/hooks/test-post-tool-use.sh`, including checks

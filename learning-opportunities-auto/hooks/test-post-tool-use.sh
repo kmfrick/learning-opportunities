@@ -6,6 +6,7 @@ HOOK="$SCRIPT_DIR/post-tool-use.sh"
 TEST_TMP=$(mktemp -d)
 readonly LARGE_RESPONSE_BYTES=500000
 readonly MAX_HOOK_SECONDS=3
+readonly MANY_JSON_STRINGS=40000
 trap 'rm -rf "$TEST_TMP"' EXIT
 
 run_hook() {
@@ -460,6 +461,112 @@ assert_ignores \
   "large shell command" \
   '{"session_id":"ignore-large-command","tool_input":{"command":"git status '"$large_response"'"},"tool_response":{}}' \
   "$MAX_HOOK_SECONDS"
+
+many_strings=$(awk -v count="$MANY_JSON_STRINGS" 'BEGIN { for (i = 1; i < count; i++) printf "\"ab\","; printf "\"ab\"" }')
+assert_triggers \
+  "session id after many response strings" \
+  '{"tool_input":{"command":"git commit -m test"},"tool_response":{"items":['"$many_strings"']},"session_id":"trigger-late-session-id"}'
+assert_ignores \
+  "session id after many response strings, timed" \
+  '{"tool_input":{"command":"git status"},"tool_response":{"items":['"$many_strings"']},"session_id":"ignore-late-session-id"}' \
+  "$MAX_HOOK_SECONDS"
+
+many_escapes=$(awk -v count="$MANY_JSON_STRINGS" 'BEGIN { for (i = 0; i < count; i++) printf "say \\\"hi\\\" -h\\n" }')
+assert_triggers \
+  "commit after large heredoc with many escapes" \
+  '{"session_id":"trigger-large-heredoc","tool_input":{"command":"cat > notes <<EOF\n'"$many_escapes"'EOF\ngit commit -m test"},"tool_response":{}}'
+assert_ignores \
+  "large heredoc with many escapes, timed" \
+  '{"session_id":"ignore-large-heredoc","tool_input":{"command":"cat > notes <<EOF\n'"$many_escapes"'EOF\ngit status"},"tool_response":{}}' \
+  "$MAX_HOOK_SECONDS"
+
+assert_ignores \
+  "commit text inside heredoc body" \
+  '{"session_id":"ignore-heredoc-body","tool_input":{"command":"cat > release.sh <<'\''EOF'\''\ngit add -A\ngit commit -m \"release\"\nEOF"},"tool_response":{}}'
+
+assert_ignores \
+  "commit text inside tab-stripped heredoc body" \
+  '{"session_id":"ignore-heredoc-strip-body","tool_input":{"command":"cat <<-EOF > release.sh\n\tgit commit -m release\n\tEOF"},"tool_response":{}}'
+
+assert_triggers \
+  "commit after heredoc" \
+  '{"session_id":"trigger-after-heredoc","tool_input":{"command":"cat > notes <<EOF\ndon'\''t\nEOF\ngit commit -m test"},"tool_response":{}}'
+
+assert_triggers \
+  "commit message from heredoc substitution" \
+  '{"session_id":"trigger-heredoc-message","tool_input":{"command":"git commit -m \"$(cat <<'\''EOF'\''\nFix -h handling\n\nCo-Authored-By: x\nEOF\n)\""},"tool_response":{}}'
+
+assert_triggers \
+  "commit after here-string" \
+  '{"session_id":"trigger-after-here-string","tool_input":{"command":"cat <<<\"hi\"\ngit commit -m test"},"tool_response":{}}'
+
+assert_triggers \
+  "commit after arithmetic shift" \
+  '{"session_id":"trigger-after-arithmetic-shift","tool_input":{"command":"x=$((1<<2))\ngit commit -m test"},"tool_response":{}}'
+
+assert_triggers \
+  "multi-line message with help-shaped first line" \
+  '{"session_id":"trigger-multiline-help-message","tool_input":{"command":"git commit -m \"Fix -h\nhandling\""},"tool_response":{}}'
+
+assert_triggers \
+  "multi-line single-quoted message with dry-run-shaped text" \
+  '{"session_id":"trigger-multiline-dry-run-message","tool_input":{"command":"git commit -m '\''Fix --dry-run\nhandling'\''"},"tool_response":{}}'
+
+assert_ignores \
+  "dry run after multi-line message" \
+  '{"session_id":"ignore-dry-run-after-multiline","tool_input":{"command":"git commit -m \"Fix\nhandling\" --dry-run"},"tool_response":{}}'
+
+assert_ignores \
+  "commit text inside multi-line quoted argument" \
+  '{"session_id":"ignore-multiline-quoted-commit","tool_input":{"command":"echo \"notes\ngit commit -m test\n\""},"tool_response":{}}'
+
+assert_triggers \
+  "commit inside multi-line substitution" \
+  '{"session_id":"trigger-multiline-substitution","tool_input":{"command":"echo \"$(\ngit commit -m test\n)\""},"tool_response":{}}'
+
+assert_triggers \
+  "commit inside multi-line bash -c" \
+  '{"session_id":"trigger-multiline-bash-c","tool_input":{"command":"bash -c '\''\ngit commit -m test\n'\''"},"tool_response":{}}'
+
+assert_triggers \
+  "commit substitution in unquoted heredoc body" \
+  '{"session_id":"trigger-heredoc-body-substitution","tool_input":{"command":"cat <<EOF\n$(git commit -m test)\nEOF"},"tool_response":{}}'
+
+assert_ignores \
+  "commit substitution in quoted heredoc body" \
+  '{"session_id":"ignore-quoted-heredoc-body-substitution","tool_input":{"command":"cat <<'\''EOF'\''\n$(git commit -m test)\nEOF"},"tool_response":{}}'
+
+assert_ignores \
+  "commit text in heredoc inside multi-line bash -c" \
+  '{"session_id":"ignore-bash-c-heredoc-body","tool_input":{"command":"bash -c '\''cat <<EOF\ngit commit -m test\nEOF'\''"},"tool_response":{}}'
+
+assert_triggers \
+  "commit after heredoc inside multi-line bash -c" \
+  '{"session_id":"trigger-bash-c-after-heredoc","tool_input":{"command":"bash -c '\''cat <<EOF\nhi\nEOF\ngit commit -m test'\''"},"tool_response":{}}'
+
+assert_triggers \
+  "unicode-escaped backslash stays literal" \
+  '{"session_id":"trigger-unicode-backslash","tool_input":{"command":"git commit -m x\u005ct--dry-run"},"tool_response":{}}'
+
+assert_ignores \
+  "unicode-escaped dry-run flag" \
+  '{"session_id":"ignore-unicode-dry-run","tool_input":{"command":"git commit -m x \u002d-dry-run"},"tool_response":{}}'
+
+assert_triggers \
+  "git commit behind timeout" \
+  '{"session_id":"trigger-timeout","tool_input":{"command":"timeout 30 git commit -m test"},"tool_response":{}}'
+
+assert_triggers \
+  "git commit behind timeout with options" \
+  '{"session_id":"trigger-timeout-options","tool_input":{"command":"timeout -k 5 --signal=TERM -v 30s git commit -m test"},"tool_response":{}}'
+
+assert_triggers \
+  "git commit behind gtimeout" \
+  '{"session_id":"trigger-gtimeout","tool_input":{"command":"gtimeout -- 30 git commit -m test"},"tool_response":{}}'
+
+assert_ignores \
+  "timeout help" \
+  '{"session_id":"ignore-timeout-help","tool_input":{"command":"timeout --help git commit"},"tool_response":{}}'
 
 session_payload='{"session_id":"session-cap","tool_input":{"command":"git commit -m test"},"tool_response":{}}'
 assert_triggers "first session offer" "$session_payload"

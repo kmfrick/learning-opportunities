@@ -38,31 +38,43 @@ parse_hook_input() {
         code = code * 16 + digit
       }
 
+      # \001 is the escaped-backslash placeholder in decoded_json.
+      if (code == 1) return "?"
       return code < ascii_code_point_limit ? sprintf("%c", code) : "?"
     }
 
-    function decoded_json(raw, output, start, slash, escape, hex) {
+    # Concatenate pieces[low..high] in O(n log n) instead of appending one by
+    # one, which copies the growing string each time.
+    function joined(pieces, low, high, middle) {
+      if (low > high) return ""
+      if (low == high) return pieces[low]
+
+      middle = int((low + high) / 2)
+      return joined(pieces, low, middle) joined(pieces, middle + 1, high)
+    }
+
+    # Decode with whole-string substitutions so commands with thousands of
+    # escapes stay linear. Escaped backslashes hide behind \001 until the end,
+    # and \u escapes are decoded last, so decoded text never starts an escape.
+    function decoded_json(raw, parts, count, part) {
       if (index(raw, "\\") == 0) return raw
 
-      start = 1
-      for (slash = 1; slash <= length(raw); slash++) {
-        if (substr(raw, slash, 1) != "\\") continue
-
-        output = output substr(raw, start, slash - start)
-        escape = substr(raw, ++slash, 1)
-        if (escape == "n" || escape == "r") output = output "\n"
-        else if (escape == "t") output = output "\t"
-        else if (escape == "b" || escape == "f") output = output " "
-        else if (escape == "u") {
-          hex = substr(raw, slash + 1, unicode_hex_length)
-          output = output decoded_unicode(hex)
-          slash += unicode_hex_length
-        } else output = output escape
-
-        start = slash + 1
+      gsub(/\\\\/, "\001", raw)
+      gsub(/\\[nr]/, "\n", raw)
+      gsub(/\\t/, "\t", raw)
+      gsub(/\\[bf]/, " ", raw)
+      gsub(/\\"/, "\"", raw)
+      gsub(/\\\//, "/", raw)
+      if (index(raw, "\\u")) {
+        count = split(raw, parts, /\\u/)
+        for (part = 2; part <= count; part++) {
+          parts[part] = decoded_unicode(substr(parts[part], 1, unicode_hex_length)) \
+            substr(parts[part], unicode_hex_length + 1)
+        }
+        raw = joined(parts, 1, count)
       }
-
-      return output substr(raw, start)
+      gsub(/\001/, "\\", raw)
+      return raw
     }
 
     function finish_string() {
@@ -104,28 +116,11 @@ parse_hook_input() {
       exit
     }
 
-    {
-      line = $0
-      line_length = length(line)
-      for (position = 1; position <= line_length; position++) {
-        c = substr(line, position, 1)
+    function scan_structure(text, text_length, position, c, parent_depth) {
+      text_length = length(text)
+      for (position = 1; position <= text_length; position++) {
+        c = substr(text, position, 1)
 
-        if (c == "\"") {
-          remainder = substr(line, position + 1)
-          if (!match(remainder, /^([^"\\]|\\.)*"/)) exit
-
-          string_is_key = container[depth] == "object" && expect_key[depth]
-          capture_string = string_is_key ||
-            (depth == root_depth && key[depth] == session_id_key) ||
-            (depth == tool_input_depth &&
-              (key[depth] == command_key || key[depth] == legacy_command_key))
-          value = substr(remainder, 1, RLENGTH - 1)
-          position += RLENGTH
-
-          finish_string()
-          if (tool_input_complete && found_session_id) emit_input()
-          continue
-        }
         if (c == "{") {
           parent_depth = depth
           depth++
@@ -162,6 +157,40 @@ parse_hook_input() {
           delete key[depth]
         }
       }
+    }
+
+    # Records split at quotes alternate between JSON structure and string
+    # contents, so each payload byte is copied once rather than once per string.
+    BEGIN { RS = "\"" }
+
+    in_string {
+      if (capture_string) value_piece[++value_pieces] = $0
+
+      # An odd run of trailing backslashes escapes the quote that ended this
+      # record, so the string continues into the next one.
+      if (match($0, /\\+$/) && RLENGTH % 2) {
+        if (capture_string) value_piece[++value_pieces] = "\""
+        next
+      }
+
+      in_string = 0
+      value = joined(value_piece, 1, value_pieces)
+      finish_string()
+      if (tool_input_complete && found_session_id) emit_input()
+      next
+    }
+
+    {
+      scan_structure($0)
+
+      string_is_key = container[depth] == "object" && expect_key[depth]
+      capture_string = string_is_key ||
+        (depth == root_depth && key[depth] == session_id_key) ||
+        (depth == tool_input_depth &&
+          (key[depth] == command_key || key[depth] == legacy_command_key))
+      delete value_piece
+      value_pieces = 0
+      in_string = 1
     }
   '
 }
@@ -208,13 +237,271 @@ git_commit_segments() {
   local -r TIME_SHORT_FLAG_OPTIONS='ahlpqv'
   local -r TIME_SHORT_VALUE_OPTIONS='fo'
   local -r TIME_VALUE_OPTIONS='-f -o --format --output'
+  local -r TIMEOUT_FLAG_OPTIONS='-f -p -v --foreground --preserve-status --verbose'
+  local -r TIMEOUT_SHORT_FLAG_OPTIONS='fpv'
+  local -r TIMEOUT_SHORT_VALUE_OPTIONS='ks'
+  local -r TIMEOUT_VALUE_OPTIONS='-k -s --kill-after --signal'
   local -r VALUE_OPTIONS='-m -F -C -c -t --message --file --reuse-message --reedit-message --fixup --squash --template --author --date --cleanup --trailer --pathspec-from-file'
   local -r SHORT_VALUE_OPTIONS='mFCct'
   local -r HELP_OPTIONS='--help -h'
   local -r DRY_RUN_OPTIONS='--dry-run --dry'
   local -r STATUS_ONLY_OPTIONS='--short --porcelain --long --null -z'
 
+  # The sed rules below see one line at a time, so first drop heredoc bodies
+  # (keeping substitutions that an unquoted delimiter still runs) and collapse
+  # quoted text that spans lines. Quotes holding substitutions or shell -c/eval
+  # code stay intact and are lexed as code because they may run a commit.
   printf '%s\n' "$1" |
+    awk -v argument_placeholder="$ARGUMENT_PLACEHOLDER" \
+      -v shell_executable_pattern="$SHELL_EXECUTABLE_PATTERN" '
+    function push(kind, position) {
+      context[++depth] = kind
+      opened_at[depth] = position
+      decided[depth] = 0
+      parentheses[depth] = 0
+    }
+
+    function pop(position) {
+      if (collapsing && depth == collapse_depth) {
+        output = collapse_prefix argument_placeholder
+        chunk_start = position + 1
+        collapsing = 0
+      }
+      depth--
+    }
+
+    # A substitution inside the collapsing quote means its text is code, so
+    # restore the buffered lines and keep the quote verbatim.
+    function abort_collapse(line_index) {
+      for (line_index = 1; line_index < raw_count; line_index++) print raw[line_index]
+      output = ""
+      chunk_start = 1
+      collapsing = 0
+    }
+
+    # Print the bodies of the command substitutions in text, one per line.
+    function print_substitutions(text, text_length, position, c, start, parentheses_left) {
+      text_length = length(text)
+      for (position = 1; position <= text_length; position++) {
+        c = substr(text, position, 1)
+        if (c == "\\") {
+          position++
+          continue
+        }
+        if (c == "`") {
+          start = position + 1
+          for (position++; position <= text_length && substr(text, position, 1) != "`"; position++) {
+            if (substr(text, position, 1) == "\\") position++
+          }
+          print substr(text, start, position - start)
+          continue
+        }
+        if (c != "$" || substr(text, position + 1, 1) != "(" || substr(text, position + 2, 1) == "(") continue
+
+        start = position + 2
+        parentheses_left = 1
+        for (position = start; position <= text_length; position++) {
+          c = substr(text, position, 1)
+          if (c == "\\") position++
+          else if (c == "(") parentheses_left++
+          else if (c == ")" && !--parentheses_left) break
+        }
+        print substr(text, start, position - start)
+      }
+    }
+
+    # Queue the delimiter of the heredoc operator at position and return the
+    # last position of its delimiter word. Inside shell -c code, the code
+    # string ends the heredoc too, so remember its closing quote.
+    function queue_heredoc(line, position, line_length, c, delimiter, strip, quote, quoted, level) {
+      line_length = length(line)
+      position += 2
+      if (substr(line, position, 1) == "-") {
+        strip = 1
+        position++
+      }
+      while (substr(line, position, 1) ~ /[ \t]/) position++
+
+      delimiter = ""
+      for (; position <= line_length; position++) {
+        c = substr(line, position, 1)
+        if (c ~ /[[:space:];&|()<>]/) break
+        if (c == "\\") {
+          quoted = 1
+          delimiter = delimiter substr(line, ++position, 1)
+          continue
+        }
+        if (c == "\047" || c == "\"") {
+          quoted = 1
+          quote = c
+          for (position++; position <= line_length && substr(line, position, 1) != quote; position++) {
+            delimiter = delimiter substr(line, position, 1)
+          }
+          continue
+        }
+        delimiter = delimiter c
+      }
+
+      if (delimiter != "") {
+        heredoc_delimiter[++heredoc_count] = delimiter
+        heredoc_strip[heredoc_count] = strip
+        heredoc_quoted[heredoc_count] = quoted
+        heredoc_closer[heredoc_count] = ""
+        for (level = depth; level; level--) {
+          if (context[level] == "code_single") heredoc_closer[heredoc_count] = "\047"
+          else if (context[level] == "code_double") heredoc_closer[heredoc_count] = "\""
+          else continue
+          break
+        }
+      }
+      return position - 1
+    }
+
+    BEGIN {
+      shell_code_pattern = "(^|[[:space:];&|(])(" shell_executable_pattern \
+        "([[:space:]]+[^[:space:]]+)*[[:space:]]+-[[:alpha:]]*c[[:alpha:]]*([[:space:]]+--)?|eval)[[:space:]]+$"
+    }
+
+    in_heredoc {
+      line = $0
+      if (heredoc_strip[heredoc_index]) sub(/^\t+/, "", line)
+      delimiter = heredoc_delimiter[heredoc_index]
+      closer = heredoc_closer[heredoc_index]
+      if (line != delimiter &&
+          (closer == "" || substr(line, 1, length(delimiter) + 1) != delimiter closer)) {
+        if (!heredoc_quoted[heredoc_index]) print_substitutions(line)
+        next
+      }
+
+      if (++heredoc_index > heredoc_count) {
+        in_heredoc = 0
+        heredoc_count = 0
+      }
+      # Text after the delimiter closes the enclosing shell -c string.
+      $0 = substr(line, length(delimiter) + 1)
+      if (in_heredoc || $0 == "") next
+    }
+
+    {
+      line = $0
+      line_length = length(line)
+      if (collapsing) {
+        raw[++raw_count] = line
+        chunk_start = 0
+      } else {
+        chunk_start = 1
+      }
+
+      for (position = 1; position <= line_length; position++) {
+        c = substr(line, position, 1)
+        next_c = substr(line, position + 1, 1)
+        kind = depth ? context[depth] : ""
+
+        if (kind == "single") {
+          if (c == "\047") pop(position)
+          continue
+        }
+        if (kind == "code_single" && c == "\047") {
+          depth--
+          continue
+        }
+        if (c == "\\") {
+          position++
+          continue
+        }
+        if (kind == "code_double" && c == "\"") {
+          depth--
+          continue
+        }
+        if (kind == "ansi") {
+          if (c == "\047") pop(position)
+          continue
+        }
+        if (kind == "double") {
+          if (c == "\"") {
+            pop(position)
+            continue
+          }
+          if (c != "`" && !(c == "$" && next_c == "(")) continue
+          if (collapsing && depth == collapse_depth) abort_collapse()
+        }
+        if (kind == "arithmetic") {
+          if (c == "(") parentheses[depth]++
+          else if (c == ")" && !--parentheses[depth]) depth--
+          continue
+        }
+
+        if (c == "$" && next_c == "(") {
+          if (substr(line, position + 2, 1) == "(") {
+            push("arithmetic", position)
+            parentheses[depth] = 2
+            position += 2
+          } else {
+            push("substitution", position)
+            parentheses[depth] = 1
+            position++
+          }
+          continue
+        }
+        if (c == "`") {
+          if (kind == "backtick") depth--
+          else push("backtick", position)
+          continue
+        }
+        if (kind == "substitution") {
+          if (c == "(") parentheses[depth]++
+          else if (c == ")" && !--parentheses[depth]) {
+            depth--
+            continue
+          }
+        }
+
+        if (c == "#" && (position == 1 || substr(line, position - 1, 1) ~ /[[:space:];&|()]/)) break
+        if (c == "\047" || c == "\"") {
+          code = substr(line, 1, position - 1) ~ shell_code_pattern ? "code_" : ""
+          push(code (c == "\047" ? "single" : "double"), position)
+        }
+        else if (c == "$" && next_c == "\047") {
+          push("ansi", position)
+          position++
+        }
+        else if (c == "<" && next_c == "<" && substr(line, position + 2, 1) != "<" &&
+            substr(line, position - 1, 1) != "<") {
+          position = queue_heredoc(line, position)
+        }
+      }
+
+      # Quotes still open at the end of the line span lines. Collapse the
+      # innermost one unless it holds a substitution; shell code quotes are
+      # lexed as code instead and never match here.
+      for (level = 1; !collapsing && level <= depth; level++) {
+        if (decided[level] || context[level] !~ /^(single|double|ansi)$/) continue
+
+        decided[level] = 1
+        if (level < depth) continue
+
+        collapsing = 1
+        collapse_depth = level
+        collapse_prefix = output substr(line, chunk_start, opened_at[level] - chunk_start)
+        raw_count = 1
+        raw[1] = output substr(line, chunk_start)
+      }
+
+      if (!collapsing) {
+        print output substr(line, chunk_start)
+        output = ""
+      }
+      if (heredoc_count) {
+        in_heredoc = 1
+        heredoc_index = 1
+      }
+    }
+
+    END {
+      if (collapsing) {
+        for (line_index = 1; line_index <= raw_count; line_index++) print raw[line_index]
+      }
+    }' |
     sed -E \
       -e "s#(^|[[:space:]])(([^[:space:]]*/)?env[[:space:]]+([^'\";|&]+[[:space:]]+)*(-[^[:space:]'\";|&]*S|--split-string)(=|[[:space:]]+)?)'([^']*)'#\\1\\2$ARGUMENT_PLACEHOLDER; \\7#g" \
       -e "s#(^|[[:space:]])(([^[:space:]]*/)?env[[:space:]]+([^'\";|&]+[[:space:]]+)*(-[^[:space:]'\";|&]*S|--split-string)(=|[[:space:]]+)?)\"(([^\"\\\\]|\\\\.)*)\"#\\1\\2$ARGUMENT_PLACEHOLDER; \\7#g" \
@@ -383,6 +670,10 @@ git_commit_segments() {
       -v time_short_flag_options="$TIME_SHORT_FLAG_OPTIONS" \
       -v time_short_value_options="$TIME_SHORT_VALUE_OPTIONS" \
       -v time_value_options="$TIME_VALUE_OPTIONS" \
+      -v timeout_flag_options="$TIMEOUT_FLAG_OPTIONS" \
+      -v timeout_short_flag_options="$TIMEOUT_SHORT_FLAG_OPTIONS" \
+      -v timeout_short_value_options="$TIMEOUT_SHORT_VALUE_OPTIONS" \
+      -v timeout_value_options="$TIMEOUT_VALUE_OPTIONS" \
       -v value_options="$VALUE_OPTIONS" -v short_value_options="$SHORT_VALUE_OPTIONS" \
       -v help_options="$HELP_OPTIONS" -v dry_run_options="$DRY_RUN_OPTIONS" \
       -v status_only_options="$STATUS_ONLY_OPTIONS" '
@@ -434,6 +725,8 @@ git_commit_segments() {
         to_set(wrapper_non_executing_options, wrapper_non_executing_option)
         to_set(time_flag_options, time_flag_option)
         to_set(time_value_options, time_value_option)
+        to_set(timeout_flag_options, timeout_flag_option)
+        to_set(timeout_value_options, timeout_value_option)
         to_set(value_options, value_option)
         to_set(help_options, help_option)
         to_set(dry_run_options, dry_run_option)
@@ -592,6 +885,34 @@ git_commit_segments() {
               if (token == "--") i++
               break
             }
+            continue
+          }
+
+          # timeout (or coreutils gtimeout) takes a duration before the command.
+          if (wrapper == "timeout" || wrapper == "gtimeout") {
+            for (i++; i <= NF; i++) {
+              token = $i
+              if (token in wrapper_non_executing_option) next
+              if (token in timeout_flag_option) continue
+              if (token in timeout_value_option) {
+                i++
+                continue
+              }
+
+              option = token
+              sub(/=.*/, "", option)
+              if (option in timeout_value_option && token != option) continue
+
+              consumes_next = short_cluster_consumes_next(token, timeout_short_flag_options, timeout_short_value_options)
+              if (consumes_next != CLUSTER_INVALID) {
+                if (consumes_next) i++
+                continue
+              }
+
+              if (token == "--") i++
+              break
+            }
+            i++
             continue
           }
 
